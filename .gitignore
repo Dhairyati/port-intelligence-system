@@ -1,0 +1,32 @@
+# Virtual environments
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+
+# Raw datasets
+data/raw/
+
+# Processed outputs (optional)
+data/processed/
+
+# Predictions (optional)
+data/predictions/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code settings (optional)
+.vscode/
+
+# Large model artifacts
+models/*.pkl
+models/*.joblib

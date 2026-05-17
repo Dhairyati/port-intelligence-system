@@ -1,0 +1,87 @@
+# =============================================================================
+# Port Intelligence System — Central Configuration
+# =============================================================================
+# All scripts read from this file. Never hardcode ports, paths, or dates
+# directly in Python files. Change settings here and everything updates.
+
+# -----------------------------------------------------------------------------
+# Ports to track
+# Each entry has a human-readable name, ISO country code, and the lat/lon
+# coordinates used to query the weather API and define the anchorage zone.
+# -----------------------------------------------------------------------------
+ports:
+  - name: "Los Angeles"
+    country: "US"
+    lat: 33.7361
+    lon: -118.2922
+
+  - name: "Rotterdam"
+    country: "NL"
+    lat: 51.9225
+    lon: 4.4792
+
+  - name: "Singapore"
+    country: "SG"
+    lat: 1.2655
+    lon: 103.8200
+
+  - name: "Shanghai"
+    country: "CN"
+    lat: 31.2304
+    lon: 121.4737
+
+  - name: "Hamburg"
+    country: "DE"
+    lat: 53.5753
+    lon: 9.8689
+
+# -----------------------------------------------------------------------------
+# Date range for historical data collection
+# ISO format: YYYY-MM-DD
+# Open-Meteo supports history from 1940 onward.
+# AIS Kaggle dataset covers ~2023 depending on which dataset you download.
+# -----------------------------------------------------------------------------
+data:
+  start_date: "2023-01-01"
+  end_date:   "2023-12-31"
+
+# -----------------------------------------------------------------------------
+# File paths (relative to project root)
+# -----------------------------------------------------------------------------
+paths:
+  raw_ais:      "data/raw/ais/"
+  raw_weather:  "data/raw/weather/"
+  processed:    "data/processed/"
+  predictions:  "data/predictions/"
+  models:       "models/"
+
+# -----------------------------------------------------------------------------
+# AIS dataset (Kaggle)
+# Set the Kaggle dataset slug here. The fetch script reads this value.
+# Default: a well-known public AIS dataset. Replace if you find a better one.
+# -----------------------------------------------------------------------------
+ais:
+  kaggle_dataset: "eminbahadirin/ship-locations-dataset"
+  filename: "ships.csv"               # filename inside the downloaded zip
+
+# -----------------------------------------------------------------------------
+# Weather API (Open-Meteo — no API key required)
+# Hourly variables fetched per port per day.
+# Full variable list: https://open-meteo.com/en/docs
+# -----------------------------------------------------------------------------
+weather:
+  base_url: "https://archive-api.open-meteo.com/v1/archive"
+  hourly_variables:
+    - "windspeed_10m"
+    - "winddirection_10m"
+    - "precipitation"
+    - "weathercode"
+  timezone: "UTC"
+
+# -----------------------------------------------------------------------------
+# Anchorage zone radius (kilometres)
+# Used in Phase 2 feature engineering to decide whether a vessel is
+# "near a port" (i.e., possibly waiting in the anchorage queue).
+# -----------------------------------------------------------------------------
+anchorage:
+  radius_km: 50
