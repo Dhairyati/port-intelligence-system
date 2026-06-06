@@ -20,3 +20,19 @@ seaborn==0.13.2
 
 # ── Storage (Parquet — used in Phase 2 but free to install now) ─────────────────
 pyarrow==16.0.0
+
+# ── Phase 3 — Machine Learning ───────────────────────────────────────────────
+xgboost==2.0.3
+shap==0.45.0
+scikit-learn==1.4.2
+
+# ── Phase 3 — Forecasting ────────────────────────────────────────────────────
+prophet==1.1.5
+
+# ── Phase 3 — Model persistence ──────────────────────────────────────────────
+joblib==1.4.2
+
+# ── Phase 5 — Dashboard ───────────────────────────────────────────────────────
+streamlit==1.35.0
+pydeck==0.9.0
+plotly==5.22.0

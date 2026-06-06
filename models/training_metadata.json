@@ -1,0 +1,43 @@
+{
+  "random_state": 42,
+  "holdout_split_date": "2023-03-02",
+  "n_cv_splits": 5,
+  "xgb_params": {
+    "n_estimators": 200,
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 3,
+    "gamma": 0.1,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "eval_metric": "auc",
+    "random_state": 42,
+    "verbosity": 0
+  },
+  "leakage_columns": [
+    "congestion_label",
+    "port_congestion_score",
+    "port_congestion_score_norm",
+    "congestion_pressure_index",
+    "weather_congestion_interaction",
+    "vessels_7d_rolling_norm",
+    "nearest_port",
+    "date",
+    "season"
+  ],
+  "notes": {
+    "anchored_ratio_dominance": "anchored_ratio (SHAP=2.67) dominates feature importance. It is computed as anchored_pings/total_pings \u2014 closely related to slow_vessel_ratio which feeds into port_congestion_score. This is borderline leakage even though the score itself was excluded. Flagged for evaluation report discussion.",
+    "perfect_auc_explanation": "XGBoost AUC=1.0 on holdout likely reflects clean label separability within Q1 2023 for these 5 ports. Leave-one-port-out test in evaluate_classifier.py will reveal whether this generalises to unseen ports.",
+    "lr_scaling": "Logistic Regression wrapped in StandardScaler Pipeline. Raw features span very different scales \u2014 scaling required for lbfgs convergence."
+  },
+  "train_rows": 300,
+  "test_rows": 150,
+  "split_date": "2023-03-02",
+  "spw": 1.4793388429752066,
+  "lr_auc": 0.9731793630098715,
+  "xgb_auc": 1.0,
+  "lr_f1": 0.9026548672566371,
+  "xgb_f1": 0.9827586206896551
+}

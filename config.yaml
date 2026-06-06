@@ -15,25 +15,25 @@ ports:
     lat: 33.7361
     lon: -118.2922
 
-  - name: "Rotterdam"
-    country: "NL"
-    lat: 51.9225
-    lon: 4.4792
+  - name: "Houston"
+    country: "US"
+    lat: 29.7355
+    lon: -95.0146
 
-  - name: "Singapore"
-    country: "SG"
-    lat: 1.2655
-    lon: 103.8200
+  - name: "Savannah"
+    country: "US"
+    lat: 32.0835
+    lon: -81.0998
 
-  - name: "Shanghai"
-    country: "CN"
-    lat: 31.2304
-    lon: 121.4737
+  - name: "Seattle"
+    country: "US"
+    lat: 47.6062
+    lon: -122.3321
 
-  - name: "Hamburg"
-    country: "DE"
-    lat: 53.5753
-    lon: 9.8689
+  - name: "New York"
+    country: "US"
+    lat: 40.6840
+    lon: -74.0440
 
 # -----------------------------------------------------------------------------
 # Date range for historical data collection
@@ -84,4 +84,4 @@ weather:
 # "near a port" (i.e., possibly waiting in the anchorage queue).
 # -----------------------------------------------------------------------------
 anchorage:
-  radius_km: 50
+  radius_km: 25

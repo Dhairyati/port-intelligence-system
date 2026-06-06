@@ -1,0 +1,46 @@
+# =============================================================================
+# Port Intelligence System — Streamlit Configuration
+# =============================================================================
+# This file is read by Streamlit at startup before any Python runs.
+# It sets the base layout, font, and default theme.
+# Dark/light toggle is handled in app.py via st.session_state —
+# this file sets the initial default (dark — maritime feel).
+
+[global]
+# Show deprecation warnings in the browser — useful during development
+showWarningOnDirectExecution = false
+
+[server]
+# Allow running without browser auto-open (needed for cloud deployment)
+headless            = true
+# Port — Streamlit Cloud overrides this; useful for local dev
+port                = 8501
+# Enable CORS for Streamlit Cloud embedding
+enableCORS          = false
+enableXsrfProtection = true
+
+[browser]
+# Disable usage statistics reporting
+gatherUsageStats = false
+
+[theme]
+# -----------------------------------------------------------------------------
+# Default theme: Dark (maritime/professional feel)
+# The in-app toggle in app.py switches between dark and light by
+# rewriting this section programmatically via st.session_state.
+# -----------------------------------------------------------------------------
+base                = "dark"
+primaryColor        = "#2196F3"       # blue — used for buttons, sliders, highlights
+backgroundColor     = "#0E1117"       # near-black background
+secondaryBackgroundColor = "#1E2130"  # slightly lighter — sidebar, cards
+textColor           = "#FAFAFA"       # near-white text
+font                = "sans serif"
+
+[runner]
+# Rerun on file save during development
+magicEnabled        = true
+# Faster reruns — don't wait for all imports on each run
+fastReruns          = true
+
+[client]
+showSidebarNavigation = false

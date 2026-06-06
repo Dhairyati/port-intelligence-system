@@ -1,0 +1,6 @@
+held_out_port,train_rows,test_rows,lopo_auc,lopo_f1
+Houston,360,90,1.0,0.1714
+Los Angeles,360,90,0.9773,0.8889
+New York,360,90,0.5,0.0
+Savannah,360,90,0.9981,0.7
+Seattle,360,90,1.0,1.0

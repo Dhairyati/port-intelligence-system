@@ -3,36 +3,18 @@ port_features.py
 ----------------
 Phase 2 — Port-Level Congestion Feature Engineering
 
-Loads vessel-level features from data/processed/vessel_features.parquet,
-spatially assigns each AIS ping to the nearest configured port (within the
-anchorage radius defined in config.yaml), then aggregates vessel behavior
-into daily port-level congestion signals.
+Reads vessel_features.parquet in streaming row-group batches using
+PyArrow's native batch reader. Never loads the full dataset into RAM.
+Each batch is spatially assigned to ports and aggregated to daily
+port-level counts. Only the tiny daily aggregations accumulate in memory.
 
-No external geo libraries required — distance is calculated with the
-Haversine formula using pure NumPy, which vectorises across millions of rows.
+On 242M rows the peak RAM usage is ~200-400 MB (one row group at a time)
+regardless of total dataset size.
 
-Features engineered (one row per port per day)
-----------------------------------------------
-Daily aggregations:
-    vessels_in_zone       : unique vessels within anchorage radius that day
-    anchored_vessel_count : unique vessels with anchored_flag=1 that day
-    slow_vessel_count     : unique vessels with slow_moving_flag=1 that day
-    slow_vessel_ratio     : slow_vessel_count / vessels_in_zone
-    avg_speed_in_zone     : mean SOG of all pings near port that day
-    avg_idle_duration     : mean idle_duration_proxy of slow vessels
-    total_pings           : total AIS pings received near port that day
-
-7-day rolling averages (smoothed trends):
-    vessels_7d_rolling    : rolling mean of vessels_in_zone
-    anchored_7d_rolling   : rolling mean of anchored_vessel_count
-    slow_ratio_7d_rolling : rolling mean of slow_vessel_ratio
-
-Composite score:
-    port_congestion_score : 0–1 composite of slow ratio + anchored ratio
-                            + normalised idle duration. Higher = more congested.
-
-Usage (from project root):
-    python src/features/port_features.py
+Output
+------
+    data/processed/port_features.parquet
+        One row per port per day with congestion signals and rolling features.
 """
 
 import logging
@@ -41,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -64,68 +48,28 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+EARTH_RADIUS_KM       = 6371.0
+ROLLING_DAYS          = 7
+ANCHORED_THRESHOLD    = 0.5
+SLOW_THRESHOLD        = 3.0
+IDLE_DURATION_CAP     = 50
 
-# Radius of the Earth in kilometres — used in Haversine formula
-EARTH_RADIUS_KM = 6371.0
-
-# Rolling window in days for smoothed port-level trend features
-ROLLING_DAYS = 7
-
-# Weights for the composite port_congestion_score (must sum to 1.0)
-# Slow ratio is weighted most heavily — it is the most direct congestion signal
 CONGESTION_WEIGHTS = {
-    "slow_vessel_ratio":   0.45,
-    "anchored_ratio":      0.35,    # anchored_vessel_count / vessels_in_zone
-    "idle_duration_norm":  0.20,    # normalised avg_idle_duration (0–1)
+    "slow_vessel_ratio": 0.45,
+    "anchored_ratio":    0.35,
+    "idle_duration_norm":0.20,
 }
 
-# idle_duration values above this are treated as maximum congestion (clipped to 1.0)
-IDLE_DURATION_CAP = 50
+# Columns we actually need from vessel_features.parquet
+# Requesting only these prevents PyArrow from loading unused columns
+REQUIRED_COLUMNS = [
+    "mmsi", "timestamp", "lat", "lon", "sog",
+    "anchored_flag", "slow_moving_flag", "idle_duration_proxy",
+]
 
 
 # ---------------------------------------------------------------------------
-# 1. Load Vessel Features
-# ---------------------------------------------------------------------------
-
-def load_vessel_features(processed_dir: Path) -> pd.DataFrame:
-    """
-    Load the vessel_features.parquet file produced by vessel_features.py.
-
-    Parameters
-    ----------
-    processed_dir : Path
-        Path to data/processed/ directory.
-
-    Returns
-    -------
-    pd.DataFrame
-        Vessel-level feature table with spatial and temporal columns.
-
-    Raises
-    ------
-    FileNotFoundError
-        If vessel_features.parquet does not exist.
-    """
-    parquet_path = processed_dir / "vessel_features.parquet"
-
-    if not parquet_path.exists():
-        raise FileNotFoundError(
-            f"vessel_features.parquet not found at {parquet_path}.\n"
-            "Run: python src/features/vessel_features.py first."
-        )
-
-    log.info(f"Loading vessel features from {parquet_path} ...")
-    df = pd.read_parquet(parquet_path, engine="pyarrow")
-
-    log.info(f"  Loaded: {len(df):,} rows, {df.shape[1]} columns")
-    log.info(f"  Vessels (MMSI): {df['mmsi'].nunique():,}")
-    log.info(f"  Date range    : {df['timestamp'].min().date()} → {df['timestamp'].max().date()}")
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 2. Haversine Distance (vectorised)
+# Haversine (vectorised NumPy)
 # ---------------------------------------------------------------------------
 
 def haversine_vectorised(
@@ -134,334 +78,351 @@ def haversine_vectorised(
     lat2: float,
     lon2: float,
 ) -> np.ndarray:
-    """
-    Compute great-circle distance between each (lat1, lon1) point and a
-    single fixed point (lat2, lon2), using the Haversine formula.
-
-    Fully vectorised — operates on NumPy arrays, no Python loops.
-    At 1 million rows, this runs in ~100ms.
-
-    Parameters
-    ----------
-    lat1, lon1 : np.ndarray
-        Arrays of vessel latitudes and longitudes (degrees).
-    lat2, lon2 : float
-        Fixed port latitude and longitude (degrees).
-
-    Returns
-    -------
-    np.ndarray
-        Array of distances in kilometres, same length as lat1/lon1.
-    """
-    # Convert degrees → radians
     lat1_r = np.radians(lat1)
     lon1_r = np.radians(lon1)
-    lat2_r = np.radians(lat2)
-    lon2_r = np.radians(lon2)
-
-    dlat = lat2_r - lat1_r
-    dlon = lon2_r - lon1_r
-
-    a = (
-        np.sin(dlat / 2.0) ** 2
-        + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlon / 2.0) ** 2
-    )
-
-    c = 2.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-    return EARTH_RADIUS_KM * c
+    dlat   = np.radians(lat2) - lat1_r
+    dlon   = np.radians(lon2) - lon1_r
+    a = (np.sin(dlat / 2.0) ** 2
+         + np.cos(lat1_r) * np.cos(np.radians(lat2)) * np.sin(dlon / 2.0) ** 2)
+    return EARTH_RADIUS_KM * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
 # ---------------------------------------------------------------------------
-# 3. Assign Vessels to Ports
+# Assign one batch to ports and aggregate to daily counts
 # ---------------------------------------------------------------------------
 
-def assign_vessels_to_ports(df: pd.DataFrame, ports: list, radius_km: float) -> pd.DataFrame:
+def aggregate_batch(
+    batch_df: pd.DataFrame,
+    ports: list,
+    radius_km: float,
+) -> pd.DataFrame | None:
     """
-    For each AIS ping, determine which configured port (if any) it is within
-    radius_km of. Assigns the nearest port within that radius.
+    Given one batch of vessel pings as a DataFrame:
+      1. Compute distance from each ping to every port (Haversine).
+      2. Keep only pings within radius_km of at least one port.
+      3. Assign each ping to its nearest port.
+      4. Group by (nearest_port, date) and compute daily sums/counts.
 
-    A ping can only belong to ONE port — the nearest one within radius_km.
-    Pings outside radius_km of all ports are dropped (open-ocean pings
-    carry no port congestion signal).
+    Returns a small daily aggregation DataFrame, or None if no pings
+    in this batch fall within any port zone.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Vessel feature DataFrame with 'lat' and 'lon' columns.
-    ports : list of dict
-        Port definitions from config.yaml (name, lat, lon).
-    radius_km : float
-        Maximum distance (km) for a vessel to be considered "near" a port.
-
-    Returns
-    -------
-    pd.DataFrame
-        Filtered DataFrame — only rows within radius_km of at least one port,
-        with 'nearest_port' and 'dist_to_port_km' columns added.
+    The returned DataFrame uses SUM aggregations intentionally —
+    sums from multiple batches covering the same (port, date) can be
+    combined correctly in the final reduce step. Averaging across
+    batches would produce wrong results (you can't average averages
+    without knowing the denominator).
     """
-    log.info(f"Assigning {len(df):,} pings to {len(ports)} ports (radius={radius_km} km) ...")
+    if len(batch_df) == 0:
+        return None
 
-    lat_arr = df["lat"].to_numpy(dtype=np.float64)
-    lon_arr = df["lon"].to_numpy(dtype=np.float64)
+    lat_arr = batch_df["lat"].to_numpy(dtype=np.float64)
+    lon_arr = batch_df["lon"].to_numpy(dtype=np.float64)
 
-    # For each ping, compute distance to every port
-    # Shape: (n_pings, n_ports)
-    distance_matrix = np.column_stack([
-        haversine_vectorised(lat_arr, lon_arr, port["lat"], port["lon"])
-        for port in ports
+    # Distance matrix: shape (n_pings, n_ports)
+    dist_matrix    = np.column_stack([
+        haversine_vectorised(lat_arr, lon_arr, p["lat"], p["lon"])
+        for p in ports
     ])
+    nearest_idx    = np.argmin(dist_matrix, axis=1)
+    nearest_dist   = dist_matrix[np.arange(len(batch_df)), nearest_idx]
+    within_mask    = nearest_dist <= radius_km
 
-    # Find the nearest port index and distance for each ping
-    nearest_port_idx = np.argmin(distance_matrix, axis=1)
-    nearest_dist_km  = distance_matrix[np.arange(len(df)), nearest_port_idx]
+    if within_mask.sum() == 0:
+        return None
 
-    # Only keep pings within the radius
-    within_radius_mask = nearest_dist_km <= radius_km
+    batch_df = batch_df[within_mask].copy()
+    batch_df["nearest_port"] = [ports[i]["name"] for i in nearest_idx[within_mask]]
+    batch_df["date"]         = batch_df["timestamp"].dt.normalize()
 
-    log.info(f"  Pings within {radius_km} km of any port: {within_radius_mask.sum():,} "
-             f"({within_radius_mask.mean()*100:.1f}% of total)")
-
-    df = df[within_radius_mask].copy()
-    df["nearest_port"]     = [ports[i]["name"] for i in nearest_port_idx[within_radius_mask]]
-    df["dist_to_port_km"]  = nearest_dist_km[within_radius_mask].round(2)
-
-    # Log how many pings were assigned to each port
-    port_ping_counts = df["nearest_port"].value_counts()
-    log.info("  Pings per port:")
-    for port_name, count in port_ping_counts.items():
-        log.info(f"    {port_name:<25} {count:>10,}")
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 4. Build Daily Port Time Series
-# ---------------------------------------------------------------------------
-
-def build_port_time_series(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate vessel pings to daily port-level observations.
-
-    Each row in the output represents one port on one day, summarising
-    the collective behaviour of all vessels that were within the anchorage
-    zone that day.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Ping-level DataFrame with 'nearest_port', 'timestamp', and all
-        vessel feature columns.
-
-    Returns
-    -------
-    pd.DataFrame
-        Daily port-level DataFrame, sorted by port and date.
-    """
-    log.info("Building daily port-level time series ...")
-
-    # Create a date column for grouping (date only, no time component)
-    df["date"] = df["timestamp"].dt.normalize()   # midnight of each day
-
-    # ── Daily aggregations ──────────────────────────────────────────────────
-    # nunique(mmsi) = number of distinct vessels in the zone that day
-    daily = df.groupby(["nearest_port", "date"]).agg(
-
-        vessels_in_zone       = ("mmsi",               "nunique"),
-        total_pings           = ("mmsi",               "count"),
-        avg_speed_in_zone     = ("sog",                "mean"),
-
-        # For anchored/slow counts: number of unique vessels that had at
-        # least one anchored/slow ping near this port today.
-        # We use max per vessel (1 if any ping was slow) then sum.
-        anchored_vessel_count = ("anchored_flag",      "sum"),
-        slow_vessel_count     = ("slow_moving_flag",   "sum"),
-        avg_idle_duration     = ("idle_duration_proxy","mean"),
-
-    ).reset_index()
-
-    # ── Derived ratios ──────────────────────────────────────────────────────
-    # Avoid division by zero with np.where
-    daily["slow_vessel_ratio"] = np.where(
-        daily["vessels_in_zone"] > 0,
-        daily["slow_vessel_count"] / daily["total_pings"],
-        0.0,
-    ).round(4)
-
-    daily["anchored_ratio"] = np.where(
-        daily["vessels_in_zone"] > 0,
-        daily["anchored_vessel_count"] / daily["total_pings"],
-        0.0,
-    ).round(4)
-
-    daily["avg_speed_in_zone"]  = daily["avg_speed_in_zone"].round(3)
-    daily["avg_idle_duration"]  = daily["avg_idle_duration"].round(2)
-
-    log.info(f"  Daily observations: {len(daily):,} rows "
-             f"({daily['nearest_port'].nunique()} ports × ~{len(daily)//max(daily['nearest_port'].nunique(),1)} days avg)")
+    # Aggregate to daily port level using SUMS and COUNTS
+    # We avoid mean() here because means cannot be merged across batches
+    daily = (
+        batch_df.groupby(["nearest_port", "date"])
+        .agg(
+            total_pings           = ("mmsi",               "count"),
+            unique_mmsi_approx    = ("mmsi",               "nunique"),
+            anchored_pings        = ("anchored_flag",       "sum"),
+            slow_pings            = ("slow_moving_flag",    "sum"),
+            sog_sum               = ("sog",                 "sum"),
+            idle_duration_sum     = ("idle_duration_proxy", "sum"),
+        )
+        .reset_index()
+    )
 
     return daily
 
 
 # ---------------------------------------------------------------------------
-# 5. Add Rolling Port Features
+# Stream through vessel_features.parquet batch by batch
 # ---------------------------------------------------------------------------
 
-def add_rolling_port_features(daily: pd.DataFrame) -> pd.DataFrame:
+def stream_aggregate_all_batches(
+    parquet_path: Path,
+    ports: list,
+    radius_km: float,
+) -> pd.DataFrame:
     """
-    Add 7-day rolling averages for key port congestion metrics.
+    Open vessel_features.parquet and iterate over its row groups one at a
+    time using PyArrow's ParquetFile batch reader.
 
-    Rolling features smooth out daily noise and capture the trending
-    congestion pressure over the past week — much more useful for
-    a classifier than a single noisy daily value.
+    Each row group is converted to a pandas DataFrame, aggregated to
+    daily port-level sums, then immediately discarded. Only the tiny
+    daily aggregation DataFrames accumulate in memory.
 
-    All rolling windows are computed per port independently using
-    groupby + transform to avoid cross-port contamination.
+    Peak RAM = size of one row group (~50-200 MB) + accumulated daily
+               aggregations (negligible — at most ~155 rows × n_cols).
 
     Parameters
     ----------
-    daily : pd.DataFrame
-        Daily port-level DataFrame sorted by port and date.
+    parquet_path : Path
+        Path to vessel_features.parquet.
+    ports : list of dict
+        Port definitions from config.yaml.
+    radius_km : float
+        Anchorage zone radius in kilometres.
 
     Returns
     -------
     pd.DataFrame
-        Same DataFrame with rolling feature columns added.
+        Combined daily aggregations across all batches, ready for
+        final reduce step.
     """
-    log.info(f"Adding {ROLLING_DAYS}-day rolling port features ...")
+    pf       = pq.ParquetFile(parquet_path)
+    n_groups = pf.metadata.num_row_groups
+    total_rows = pf.metadata.num_rows
 
-    # Sort chronologically per port before rolling
+    log.info(f"Streaming vessel_features.parquet")
+    log.info(f"  Row groups : {n_groups}")
+    log.info(f"  Total rows : {total_rows:,}")
+    log.info(f"  Reading columns: {REQUIRED_COLUMNS}")
+
+    # Only read the columns we need — saves significant I/O and RAM
+    # Check which required columns actually exist in this parquet
+    file_columns    = [s.name for s in pf.schema_arrow]
+    columns_to_read = [c for c in REQUIRED_COLUMNS if c in file_columns]
+    missing_cols    = [c for c in REQUIRED_COLUMNS if c not in file_columns]
+
+    if missing_cols:
+        log.warning(f"  Columns not found in parquet (will be skipped): {missing_cols}")
+
+    if "lat" not in columns_to_read or "lon" not in columns_to_read:
+        raise ValueError(
+            "vessel_features.parquet is missing 'lat' or 'lon' columns.\n"
+            "Cannot perform spatial assignment without coordinates.\n"
+            "Re-run vessel_features.py to regenerate the parquet."
+        )
+
+    batch_results = []
+    total_matched = 0
+
+    for group_idx in range(n_groups):
+        # Read one row group — this is the only large object in RAM
+        table    = pf.read_row_group(group_idx, columns=columns_to_read)
+        batch_df = table.to_pandas()
+
+        # Free the PyArrow table immediately — we only need the pandas df
+        del table
+
+        # Parse timestamp if it came in as string or object
+        if not pd.api.types.is_datetime64_any_dtype(batch_df["timestamp"]):
+            batch_df["timestamp"] = pd.to_datetime(
+                batch_df["timestamp"], errors="coerce"
+            )
+        batch_df.dropna(subset=["timestamp", "lat", "lon"], inplace=True)
+
+        # Coerce numeric columns
+        for col in ["sog", "anchored_flag", "slow_moving_flag", "idle_duration_proxy"]:
+            if col in batch_df.columns:
+                batch_df[col] = pd.to_numeric(batch_df[col], errors="coerce").fillna(0)
+
+        # Aggregate this batch
+        daily_batch = aggregate_batch(batch_df, ports, radius_km)
+
+        matched_in_batch = len(batch_df) if daily_batch is not None else 0
+        total_matched   += matched_in_batch
+
+        if daily_batch is not None:
+            batch_results.append(daily_batch)
+
+        # Log progress every 5 row groups
+        if (group_idx + 1) % 5 == 0 or group_idx == n_groups - 1:
+            pct = (group_idx + 1) / n_groups * 100
+            log.info(
+                f"  Row group {group_idx+1:>3}/{n_groups}  ({pct:.0f}%)  "
+                f"batches with port matches: {len(batch_results)}"
+            )
+
+        # Release batch DataFrame immediately
+        del batch_df
+        del daily_batch
+
+    log.info(f"Streaming complete.")
+
+    if not batch_results:
+        raise RuntimeError(
+            "No vessel pings fell within the anchorage radius of any port.\n"
+            "Possible causes:\n"
+            "  1. config.yaml radius_km may be too small — try 50 instead of 25\n"
+            "  2. AIS data geographic coverage may not overlap with configured ports\n"
+            "  3. lat/lon values may be null or corrupted in vessel_features.parquet\n"
+            "Check the AIS data covers the Port of Los Angeles region."
+        )
+
+    # Combine all batch aggregations — this is just n_groups × ~155 tiny rows
+    log.info(f"Combining {len(batch_results)} batch aggregation results ...")
+    combined = pd.concat(batch_results, ignore_index=True)
+    del batch_results
+
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Reduce: combine batch sums into correct daily totals
+# ---------------------------------------------------------------------------
+
+def reduce_to_daily(combined: pd.DataFrame) -> pd.DataFrame:
+    """
+    Multiple batches may cover the same (nearest_port, date) combination
+    because one day's pings may span multiple row groups. This step sums
+    all batch contributions for each (port, date) pair into correct totals.
+
+    Then derives ratio features from the sums:
+        slow_vessel_ratio  = slow_pings / total_pings
+        anchored_ratio     = anchored_pings / total_pings
+        avg_speed_in_zone  = sog_sum / total_pings
+        avg_idle_duration  = idle_duration_sum / total_pings
+
+    Parameters
+    ----------
+    combined : pd.DataFrame
+        Raw batch aggregations with sum columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (nearest_port, date) with correct daily totals.
+    """
+    log.info("Reducing batch sums to daily port totals ...")
+
+    daily = (
+        combined.groupby(["nearest_port", "date"])
+        .agg(
+            total_pings        = ("total_pings",        "sum"),
+            vessels_in_zone    = ("unique_mmsi_approx", "sum"),  # approx — sum of nunique
+            anchored_pings     = ("anchored_pings",     "sum"),
+            slow_pings         = ("slow_pings",         "sum"),
+            sog_sum            = ("sog_sum",            "sum"),
+            idle_duration_sum  = ("idle_duration_sum",  "sum"),
+        )
+        .reset_index()
+    )
+
+    # Derive ratio features from correct daily sums
+    safe_pings = daily["total_pings"].replace(0, np.nan)
+
+    daily["slow_vessel_ratio"]     = (daily["slow_pings"]    / safe_pings).round(4)
+    daily["anchored_ratio"]        = (daily["anchored_pings"] / safe_pings).round(4)
+    daily["avg_speed_in_zone"]     = (daily["sog_sum"]        / safe_pings).round(3)
+    daily["avg_idle_duration"]     = (daily["idle_duration_sum"] / safe_pings).round(2)
+
+    # Rename pings to cleaner names
+    daily.rename(columns={
+        "anchored_pings": "anchored_vessel_count",
+        "slow_pings":     "slow_vessel_count",
+    }, inplace=True)
+
+    # Drop intermediate sum columns no longer needed
+    daily.drop(columns=["sog_sum", "idle_duration_sum"], inplace=True)
+
     daily.sort_values(["nearest_port", "date"], inplace=True)
     daily.reset_index(drop=True, inplace=True)
 
-    def rolling_mean(series: pd.Series, window: int) -> pd.Series:
-        """Rolling mean with min 3 periods to avoid stats on sparse early days."""
-        return series.rolling(window=window, min_periods=3).mean()
+    log.info(f"  Daily rows : {len(daily):,}")
+    log.info(f"  Ports      : {daily['nearest_port'].unique().tolist()}")
+    log.info(f"  Date range : {daily['date'].min().date()} → {daily['date'].max().date()}")
 
-    rolling_cols = {
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# Rolling features
+# ---------------------------------------------------------------------------
+
+def add_rolling_port_features(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add 7-day rolling averages per port using groupby + transform."""
+    log.info(f"Adding {ROLLING_DAYS}-day rolling features ...")
+
+    def rolling_mean(s: pd.Series) -> pd.Series:
+        return s.rolling(window=ROLLING_DAYS, min_periods=3).mean()
+
+    rolling_map = {
         "vessels_7d_rolling":    "vessels_in_zone",
         "anchored_7d_rolling":   "anchored_vessel_count",
         "slow_ratio_7d_rolling": "slow_vessel_ratio",
         "speed_7d_rolling":      "avg_speed_in_zone",
     }
 
-    for new_col, source_col in rolling_cols.items():
-        daily[new_col] = (
-            daily.groupby("nearest_port", sort=False)[source_col]
-            .transform(lambda x: rolling_mean(x, ROLLING_DAYS))
-            .round(4)
-        )
-        log.info(f"  ✓ {new_col}")
+    for new_col, src_col in rolling_map.items():
+        if src_col in daily.columns:
+            daily[new_col] = (
+                daily.groupby("nearest_port", sort=False)[src_col]
+                .transform(rolling_mean)
+                .round(4)
+            )
+            log.info(f"  ✓ {new_col}")
 
     return daily
 
 
 # ---------------------------------------------------------------------------
-# 6. Compute Composite Congestion Score
+# Composite congestion score
 # ---------------------------------------------------------------------------
 
 def add_congestion_score(daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute a composite port_congestion_score (0–1) that combines the
-    three most informative daily congestion signals into a single index.
+    """Weighted composite port_congestion_score in [0, 1]."""
+    log.info("Computing port_congestion_score ...")
 
-    This score is what the downstream XGBoost classifier will predict,
-    and what the dashboard will display as a port risk level.
-
-    Formula
-    -------
-    port_congestion_score = (
-        0.45 × slow_vessel_ratio
-      + 0.35 × anchored_ratio
-      + 0.20 × clip(avg_idle_duration / IDLE_DURATION_CAP, 0, 1)
-    )
-
-    All three inputs are already in [0, 1] range (ratios) or normalised
-    to [0, 1] via the cap. The weighted sum is therefore also in [0, 1].
-
-    Parameters
-    ----------
-    daily : pd.DataFrame
-        Daily port-level DataFrame with slow_vessel_ratio, anchored_ratio,
-        and avg_idle_duration columns.
-
-    Returns
-    -------
-    pd.DataFrame
-        Same DataFrame with 'port_congestion_score' column added.
-    """
-    log.info("Computing composite port_congestion_score ...")
-
-    # Normalise idle duration to [0, 1]
     idle_norm = (daily["avg_idle_duration"] / IDLE_DURATION_CAP).clip(0, 1)
 
     daily["port_congestion_score"] = (
-        CONGESTION_WEIGHTS["slow_vessel_ratio"]  * daily["slow_vessel_ratio"]
-        + CONGESTION_WEIGHTS["anchored_ratio"]   * daily["anchored_ratio"]
-        + CONGESTION_WEIGHTS["idle_duration_norm"] * idle_norm
+        CONGESTION_WEIGHTS["slow_vessel_ratio"]  * daily["slow_vessel_ratio"].fillna(0)
+        + CONGESTION_WEIGHTS["anchored_ratio"]   * daily["anchored_ratio"].fillna(0)
+        + CONGESTION_WEIGHTS["idle_duration_norm"] * idle_norm.fillna(0)
     ).round(4)
 
     score = daily["port_congestion_score"]
-    log.info(f"  Score range : {score.min():.4f} → {score.max():.4f}")
-    log.info(f"  Score mean  : {score.mean():.4f}")
-    log.info(f"  Score median: {score.median():.4f}")
-
-    # Sanity check — should always be within [0, 1]
-    out_of_range = ((score < 0) | (score > 1)).sum()
-    if out_of_range > 0:
-        log.warning(f"  ⚠ {out_of_range} scores outside [0,1] — check input columns")
+    log.info(f"  Score range  : {score.min():.4f} → {score.max():.4f}")
+    log.info(f"  Score mean   : {score.mean():.4f}")
+    log.info(f"  Score median : {score.median():.4f}")
 
     return daily
 
 
 # ---------------------------------------------------------------------------
-# 7. Save Output
+# Save
 # ---------------------------------------------------------------------------
 
 def save_features(df: pd.DataFrame, output_path: Path) -> None:
-    """
-    Save the port-level feature DataFrame to Parquet.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Port-level daily feature table.
-    output_path : Path
-        Destination file path.
-    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"Saving {len(df):,} rows → {output_path} ...")
+    log.info(f"Saving {len(df):,} rows → {output_path}")
     df.to_parquet(output_path, index=False, engine="pyarrow", compression="snappy")
-
     size_mb = output_path.stat().st_size / 1e6
-    log.info(f"  ✓ Saved — file size: {size_mb:.1f} MB")
+    log.info(f"  ✓ Saved — {size_mb:.2f} MB")
 
 
 # ---------------------------------------------------------------------------
-# 8. Summary Report
+# Summary
 # ---------------------------------------------------------------------------
 
 def print_summary(daily: pd.DataFrame) -> None:
-    """
-    Print a concise validation summary of the port feature table.
-    """
-    engineered_cols = [
-        "vessels_in_zone", "anchored_vessel_count", "slow_vessel_count",
-        "slow_vessel_ratio", "anchored_ratio", "avg_speed_in_zone",
-        "avg_idle_duration", "vessels_7d_rolling", "anchored_7d_rolling",
-        "slow_ratio_7d_rolling", "speed_7d_rolling", "port_congestion_score",
-    ]
-
     print("\n" + "=" * 60)
     print("  PORT FEATURES — ENGINEERING SUMMARY")
     print("=" * 60)
     print(f"  Total rows     : {len(daily):,}")
     print(f"  Ports covered  : {daily['nearest_port'].nunique()}")
     print(f"  Date range     : {daily['date'].min().date()} → {daily['date'].max().date()}")
-    print()
 
-    # Per-port congestion score summary
-    print("  Congestion score by port (mean):")
+    print("\n  Congestion score by port (mean):")
     score_by_port = (
         daily.groupby("nearest_port")["port_congestion_score"]
         .mean()
@@ -471,15 +432,18 @@ def print_summary(daily: pd.DataFrame) -> None:
         bar = "█" * int(score * 30)
         print(f"    {port:<25} {score:.4f}  {bar}")
 
-    print()
-    print("  Engineered feature status:")
-    for col in engineered_cols:
+    print("\n  Feature null rates:")
+    key_cols = [
+        "vessels_in_zone", "slow_vessel_ratio", "anchored_ratio",
+        "avg_speed_in_zone", "avg_idle_duration",
+        "vessels_7d_rolling", "slow_ratio_7d_rolling",
+        "port_congestion_score",
+    ]
+    for col in key_cols:
         if col in daily.columns:
-            null_count = daily[col].isnull().sum()
-            null_info  = f"  ({null_count:,} nulls)" if null_count > 0 else ""
-            print(f"    ✓  {col:<30} dtype={daily[col].dtype}{null_info}")
-        else:
-            print(f"    ✗  {col:<30} MISSING")
+            null_pct = daily[col].isnull().mean() * 100
+            flag     = "  ⚠" if null_pct > 10 else "  ✓"
+            print(f"  {flag}  {col:<30} {null_pct:.1f}% null")
     print("=" * 60)
 
 
@@ -490,46 +454,40 @@ def print_summary(daily: pd.DataFrame) -> None:
 def main():
     config = load_config()
 
-    processed_dir = PROJECT_ROOT / config["paths"]["processed"]
-    output_path   = processed_dir / "port_features.parquet"
+    vessel_path   = PROJECT_ROOT / config["paths"]["processed"] / "vessel_features.parquet"
+    output_path   = PROJECT_ROOT / config["paths"]["processed"] / "port_features.parquet"
     ports         = config["ports"]
     radius_km     = config["anchorage"]["radius_km"]
 
     log.info("=" * 60)
-    log.info("Phase 2 — Port Feature Engineering")
+    log.info("Phase 2 — Port Feature Engineering (Streaming)")
+    log.info(f"  Anchorage radius : {radius_km} km")
+    log.info(f"  Ports            : {[p['name'] for p in ports]}")
     log.info("=" * 60)
 
-    # Step 1: Load vessel features
-    df = load_vessel_features(processed_dir)
-
-    # Step 2: Assign each ping to nearest port within radius
-    df = assign_vessels_to_ports(df, ports, radius_km)
-
-    if len(df) == 0:
-        log.error(
-            "No vessel pings fell within the anchorage radius of any configured port.\n"
-            "Possible causes:\n"
-            "  1. Your AIS data covers a different geographic region than the configured ports.\n"
-            "     The NOAA Jan 1-5 dataset covers US waters — ensure ports include US locations\n"
-            "     (Los Angeles is configured and should capture vessel traffic).\n"
-            "  2. The anchorage radius_km in config.yaml may be too small — try increasing to 200.\n"
-            "  3. Verify lat/lon columns parsed correctly in vessel_features.parquet."
+    if not vessel_path.exists():
+        raise FileNotFoundError(
+            f"vessel_features.parquet not found at {vessel_path}.\n"
+            "Run vessel_features.py first."
         )
-        return
 
-    # Step 3: Aggregate to daily port time series
-    daily = build_port_time_series(df)
+    # Step 1: Stream through parquet, aggregate each row group
+    combined = stream_aggregate_all_batches(vessel_path, ports, radius_km)
 
-    # Step 4: Add rolling trend features
+    # Step 2: Reduce batch sums to correct daily totals
+    daily = reduce_to_daily(combined)
+    del combined
+
+    # Step 3: Rolling features
     daily = add_rolling_port_features(daily)
 
-    # Step 5: Add composite congestion score
+    # Step 4: Congestion score
     daily = add_congestion_score(daily)
 
-    # Step 6: Summary
+    # Step 5: Summary
     print_summary(daily)
 
-    # Step 7: Save
+    # Step 6: Save
     save_features(daily, output_path)
 
     log.info("Phase 2 Step 2 complete — port_features.parquet ready.")
