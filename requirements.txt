@@ -19,7 +19,7 @@ pyarrow==16.0.0
 # ── Phase 3 — Machine Learning ───────────────────────────────────────────────
 xgboost==2.0.3
 shap==0.45.0
-scikit-learn==1.4.2
+scikit-learn==1.5.2
 
 # ── Phase 3 — Forecasting ────────────────────────────────────────────────────
 prophet==1.1.5
