@@ -9,10 +9,6 @@ requests==2.31.0
 pyyaml==6.0.1
 python-dotenv==1.0.1
 
-# ── Notebook / EDA ──────────────────────────────────────────────────────────────
-matplotlib==3.8.4
-seaborn==0.13.2
-
 # ── Storage (Parquet — used in Phase 2 but free to install now) ─────────────────
 pyarrow==16.0.0
 
